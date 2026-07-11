@@ -1,0 +1,280 @@
+name: Build And Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  # Needed for release creation
+  contents: write
+
+env:
+  APP_NAME: "subtitles-words-extractor"
+
+jobs:
+
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+        app_version: ${{ steps.get_version.outputs.APP_VERSION }}
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v5
+
+    # Extract the version from app/consts.py
+    - name: Get version
+      id: get_version
+      shell: bash
+      run: |
+        VER=$(sed -n "s/^VERSION=['\"]\([0-9.]*\).*/\1/p" app/consts.py)
+        echo "version=$VER"
+        echo "APP_VERSION=$VER" >> "$GITHUB_OUTPUT"
+
+
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: ['prepare']
+    strategy:
+      matrix:
+        arch: [x86_64, i686, aarch64, armv7]
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+          - arch: i686
+            platform: linux/386
+          - arch: aarch64
+            platform: linux/arm64
+          - arch: armv7
+            platform: linux/arm/v7
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v5
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build with Docker cross-compilation
+      env:
+        APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+        APP_ARCH: ${{ matrix.arch }}
+      shell: bash
+      run: |
+        mkdir -p redist
+
+        # Build for specific platform
+        docker run --platform ${{ matrix.platform }} --rm \
+          -v "$(pwd)":/app \
+          -w /app \
+          -e APP_NAME="$APP_NAME" \
+          -e APP_VERSION="$APP_VERSION" \
+          python:3.11-slim \
+          bash -c "
+            # libffi-dev is needed for armv7
+            apt-get update && apt-get install -y gcc g++ python3-tk patchelf libffi-dev && rm -rf /var/lib/apt/lists/* &&
+            pip install nuitka imageio &&
+            python -m nuitka \
+              --standalone \
+              --enable-plugin=tk-inter \
+              --output-dir=dist \
+              --output-filename="${APP_NAME}-${APP_VERSION}.bin" \
+              --assume-yes-for-downloads \
+              --linux-icon=images/logo.png \
+              --include-data-dir=images=images \
+              --product-name=\"\$APP_NAME\" \
+              --product-version=\"\$APP_VERSION\" \
+              --lto=yes \
+              main.py
+          "
+
+        # Built files are stored in dist/main.dist
+        cd dist/main.dist/
+        zip -r "../../redist/$APP_NAME-linux-$APP_ARCH-$APP_VERSION.zip" ./*
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-${{ matrix.arch }}-binary
+        path: redist/
+        if-no-files-found: error
+
+
+  build-windows:
+    needs: ['prepare']
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            runs-on: windows-latest
+          - arch: x86
+            runs-on: windows-latest
+          - arch: arm64
+            runs-on: windows-11-arm
+
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v5
+
+    - name: Install zip via Chocolatey
+      shell: powershell
+      run: choco install zip
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        architecture: ${{ matrix.arch }}
+
+    - name: Install dependencies
+      run: |
+        pip install nuitka imageio
+
+    - name: Build with Nuitka
+      env:
+        APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+        APP_ARCH: ${{ matrix.arch }}
+      shell: bash
+      run: |
+        mkdir redist
+
+        python -m nuitka \
+          --standalone \
+          --enable-plugin=tk-inter \
+          --output-dir=dist \
+          --output-filename="$APP_NAME-$APP_VERSION" \
+          --assume-yes-for-downloads \
+          --windows-icon-from-ico=images/logo.ico \
+          --include-data-dir=images=images \
+          --windows-console-mode=disable \
+          --product-name="$APP_NAME" \
+          --product-version="$APP_VERSION" \
+          --lto=yes \
+          main.py
+
+        # Built files are stored in dist/main.dist
+        cd dist/main.dist/
+        zip -r "../../redist/$APP_NAME-win-$APP_ARCH-$APP_VERSION.zip" ./*
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-${{ matrix.arch }}-binary
+        path: redist/
+        if-no-files-found: error
+
+
+  build-macos:
+    needs: ['prepare']
+    strategy:
+      matrix:
+        arch: [apple-silicon, intel]
+        include:
+          - arch: apple-silicon
+            runs-on: macos-latest
+          - arch: intel
+            runs-on: macos-15-intel
+
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      run: |
+        # pip install -r requirements.txt
+        pip install nuitka imageio
+
+    - name: Build with Nuitka
+      env:
+        APP_VERSION: ${{ needs['prepare'].outputs.app_version }}
+        APP_ARCH: ${{ matrix.arch }}
+      shell: bash
+      run: |
+        mkdir redist
+
+        python -m nuitka \
+          --standalone \
+          --enable-plugin=tk-inter \
+          --output-dir=dist \
+          --output-filename=$APP_NAME \
+          --assume-yes-for-downloads \
+          --macos-app-icon=images/logo.png \
+          --include-data-dir=images=images \
+          --macos-create-app-bundle \
+          --product-name="$APP_NAME" \
+          --product-version="$APP_VERSION" \
+          --lto=yes \
+          main.py
+
+          # Create zip from the generated above main.app folder
+          cd ./dist
+          mv main.app "${APP_NAME}.app"
+          zip -r "${APP_NAME}.zip" "${APP_NAME}.app"
+          cd ..
+
+          mv "./dist/${APP_NAME}.zip" redist/${APP_NAME}-macos-$APP_ARCH-$APP_VERSION.zip
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-${{ matrix.arch }}-binary
+        path: redist/
+        if-no-files-found: error
+
+
+  build-pyz:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Build .pyz
+      run: |
+        mkdir /tmp/redist
+        python -m zipapp . -m app.app:main -o "/tmp/redist/${APP_NAME}.pyz"
+
+    - name: Upload pyz artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: pyz
+        path: /tmp/redist/
+
+
+  release:
+    needs: ['prepare', 'build-linux', 'build-windows', 'build-macos', 'build-pyz']
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v5
+      with:
+        path: ./all_builds
+        # Do not create separate directory per artifact
+        merge-multiple: true
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: "${{ env.APP_NAME }} v${{ needs.prepare.outputs.app_version }}"
+        tag_name: "v${{ needs.prepare.outputs.app_version }}"
+        files: all_builds/*
+        preserve_order: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
